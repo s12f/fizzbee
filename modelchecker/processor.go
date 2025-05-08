@@ -288,10 +288,11 @@ func (p *Process) Fork() *Process {
 	forkLock.Lock()
 	defer forkLock.Unlock()
 
-	refs := make(map[string]*lib.Role)
-	clone.SetCustomPtrFunc(reflect.TypeOf(&lib.Role{}), roleResolveCloneFn(refs, nil, 0))
-	clone.SetCustomFunc(reflect.TypeOf(starlark.Set{}), starlarkSetResolveFn(refs, nil, 0))
-	clone.SetCustomFunc(reflect.TypeOf(starlark.Dict{}), starlarkDictResolveFn(refs, nil, 0))
+	refs := make(map[starlark.Value]starlark.Value)
+	for _, ptrType := range lib.StarlarkPtrTypes {
+		clone.SetCustomPtrFunc(reflect.TypeOf(ptrType), starlarkValuePtrResolveFn(refs, nil, 0))
+	}
+
 	p2 := &Process{
 		Name:      p.Name,
 		Heap:      p.Heap.Clone(refs, nil, 0),
@@ -352,10 +353,10 @@ func (p *Process) CloneForAssert(permutations map[lib.SymmetricValue][]lib.Symme
 	forkLock.Lock()
 	defer forkLock.Unlock()
 
-	refs := make(map[string]*lib.Role)
-	clone.SetCustomPtrFunc(reflect.TypeOf(&lib.Role{}), roleResolveCloneFn(refs, permutations, alt))
-	clone.SetCustomFunc(reflect.TypeOf(starlark.Dict{}), starlarkDictResolveFn(refs, permutations, alt))
-	clone.SetCustomFunc(reflect.TypeOf(starlark.Set{}), starlarkSetResolveFn(refs, permutations, alt))
+	refs := make(map[starlark.Value]starlark.Value)
+	for _, ptrType := range lib.StarlarkPtrTypes {
+		clone.SetCustomPtrFunc(reflect.TypeOf(ptrType), starlarkValuePtrResolveFn(refs, nil, 0))
+	}
 	clone.SetCustomFunc(reflect.TypeOf(lib.SymmetricValue{}), symmetricValueResolveFn(refs, permutations, alt))
 	p2 := &Process{
 		Name:      p.Name,
@@ -403,12 +404,12 @@ func (p *Process) CloneForAssert(permutations map[lib.SymmetricValue][]lib.Symme
 
 // MapRoleValuesInOrder returns the values of the map m.
 // The values will be in an indeterminate order.
-func MapRoleValuesInOrder(m map[string]*lib.Role, oldList []*lib.Role) []*lib.Role {
+func MapRoleValuesInOrder(m map[starlark.Value]starlark.Value, oldList []*lib.Role) []*lib.Role {
 	r := make([]*lib.Role, 0, len(m))
 	for _, v := range oldList {
 		if v != nil {
-			if role, ok := m[v.RefString()]; ok {
-				r = append(r, role)
+			if role, ok := m[v]; ok {
+				r = append(r, role.(*lib.Role))
 			}
 		}
 	}
@@ -598,9 +599,9 @@ func (p *Process) GetAllVariables() starlark.StringDict {
 	// Shallow clone the globals
 	dict := maps.Clone(p.Heap.globals)
 
-	roleRefs := make(map[string]*lib.Role)
-	for i, role := range p.Roles {
-		roleRefs[role.RefString()] = p.Roles[i]
+	roleRefs := make(map[starlark.Value]starlark.Value)
+	for _, role := range p.Roles {
+		roleRefs[role] = role
 	}
 
 	CopyDict(p.Heap.state, dict, roleRefs, nil, 0)
@@ -673,6 +674,10 @@ func (p *Process) updateVariableInternal(key string, val starlark.Value, frame *
 		// Check local variables in the scope, starting from
 		// deepest to its parent. If present, update that
 		// and continue
+		return
+	}
+	if _, ok := frame.vars[key]; ok {
+		frame.vars[key] = val
 		return
 	}
 	if p.Heap.update(key, val) {
@@ -1329,7 +1334,7 @@ func processPreInit(init *Node, stmts []*ast.Statement) {
 			panic("Not supported: No non-determinism at top level in stmt" + stmt.String())
 		}
 	}
-	vars := thread.currentFrame().scope.GetAllVisibleVariables(nil)
+	vars := thread.currentFrame().scope.GetAllVisibleVariables(make(map[starlark.Value]starlark.Value))
 	globals := starlark.StringDict{}
 	for name, _ := range vars {
 		if slices.Contains(init.Process.topLevelVars, name) {
@@ -1384,6 +1389,7 @@ func (p *Processor) processNode(node *Node) (bool, bool) {
 					node.Name = "yield"
 				}
 				node.Attach()
+				p.intermediateStates.ClearAll()
 				return true, false
 			}
 		}
@@ -1436,6 +1442,7 @@ func (p *Processor) processNode(node *Node) (bool, bool) {
 		node.Process.FailedInvariants = failedInvariants
 		if !p.config.ContinuePathOnInvariantFailures {
 			node.Name = "yield"
+			p.intermediateStates.ClearAll()
 			return true, false
 		}
 	}
